@@ -1,0 +1,165 @@
+name: Build ReSukiSU + SUSFS GKI kernel (ishtar)
+
+on:
+  workflow_dispatch:
+    inputs:
+      resukisu_ref:
+        description: "ReSukiSU branch / tag / commit"
+        default: "main"
+        required: true
+      susfs_ref:
+        description: "susfs4ksu branch / tag / commit"
+        default: "gki-android13-5.15"
+        required: true
+      version_suffix:
+        description: "uname -r suffix (after 5.15.180)"
+        default: "-android13-8-g39bd6e622fc6"
+        required: true
+
+env:
+  # AOSP android13-5.15-2025-05 release (5.15.180). The branch was renamed to
+  # deprecated/..., so the manifest entry for common/ is pinned to its tip commit.
+  MANIFEST_BRANCH: common-android13-5.15-2025-05
+  COMMON_BRANCH: deprecated/android13-5.15-2025-05
+  COMMON_COMMIT: 39bd6e622fc6c1224c41cf8ae6c1a78340129cb6
+  SUSFS_PATCH: 50_add_susfs_in_gki-android13-5.15.patch
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/share/swift /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl zip unzip xz-utils zstd bc bison flex cpio rsync \
+            libssl-dev libelf-dev python3 binutils
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+
+      - name: Sync kernel source
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel" && cd "$GITHUB_WORKSPACE/kernel"
+          repo init --depth=1 --no-use-superproject \
+            -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH"
+          sed -i "s|revision=\"android13-5.15-2025-05\" upstream=\"android13-5.15-2025-05\" dest-branch=\"android13-5.15-2025-05\"|revision=\"$COMMON_COMMIT\" upstream=\"$COMMON_BRANCH\"|" \
+            .repo/manifests/default.xml
+          grep -q "$COMMON_COMMIT" .repo/manifests/default.xml
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --fail-fast
+          test "$(git -C common rev-parse HEAD)" = "$COMMON_COMMIT"
+          head -5 common/Makefile
+          df -h /
+
+      - name: Integrate ReSukiSU
+        working-directory: kernel/common
+        run: |
+          curl -LSs https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh \
+            | bash -s "${{ inputs.resukisu_ref }}"
+          echo "RESUKISU_COMMIT=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "RESUKISU_VERSION=$(( 30000 + $(git -C KernelSU rev-list --count HEAD) + 700 ))" >> "$GITHUB_ENV"
+
+      - name: Integrate SUSFS
+        working-directory: kernel/common
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs"
+          git -C "$GITHUB_WORKSPACE/susfs" checkout "${{ inputs.susfs_ref }}"
+          echo "SUSFS_COMMIT=$(git -C "$GITHUB_WORKSPACE/susfs" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/fs/* fs/
+          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/include/linux/* include/linux/
+          patch -p1 --forward --fuzz=3 < "$GITHUB_WORKSPACE/susfs/kernel_patches/$SUSFS_PATCH"
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error::SUSFS patch left rejected hunks"; find . -name '*.rej' -exec cat {} +; exit 1
+          fi
+          grep '^#define SUSFS_VERSION' include/linux/susfs.h
+
+      - name: Configure
+        working-directory: kernel/common
+        run: |
+          cat >> arch/arm64/configs/gki_defconfig <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          # The appended defconfig is no longer in savedefconfig form.
+          sed -i 's/check_defconfig//' build.config.gki
+          # Fixed uname -r suffix; also avoids "-dirty" from the patched tree.
+          echo "${{ inputs.version_suffix }}" > .scmversion
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          LTO=thin KMI_SYMBOL_LIST_STRICT_MODE=0 \
+            BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+          DIST=out/android13-5.15/dist
+          ls -la "$DIST"
+          grep -q '^CONFIG_KSU=y' out/android13-5.15/common/.config
+          grep -q '^CONFIG_KSU_SUSFS=y' out/android13-5.15/common/.config
+          BANNER=$(grep -a -o -m1 'Linux version 5\.15[ -~]*' "$DIST/Image")
+          echo "$BANNER"
+          echo "KERNEL_RELEASE=$(echo "$BANNER" | awk '{print $3}')" >> "$GITHUB_ENV"
+          cp "$DIST/Image" "$GITHUB_WORKSPACE/Image"
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github ak3/modules ak3/patch ak3/ramdisk ak3/README.md
+          cp anykernel/anykernel.sh ak3/anykernel.sh
+          cp Image ak3/Image
+          mkdir -p out
+          NAME="ReSukiSU-${RESUKISU_VERSION}-SUSFS-${KERNEL_RELEASE}-ishtar"
+          echo "PKG_NAME=$NAME" >> "$GITHUB_ENV"
+          (cd ak3 && zip -r9 "../out/AnyKernel3-$NAME.zip" . -x '.*')
+
+      - name: Repack stock AviumUI boot.img
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p bootwork && cd bootwork
+          gh release download -R topjohnwu/Magisk -p 'Magisk-v*.apk' -O magisk.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot && chmod +x magiskboot
+          xz -dc ../stock/boot.img.xz > boot.img
+          sha256sum boot.img | cut -d' ' -f1 | grep -qx "$(cut -d' ' -f1 ../stock/boot.img.sha256)"
+          ./magiskboot unpack boot.img
+          cp ../Image kernel
+          ./magiskboot repack boot.img "../out/boot-$PKG_NAME.img"
+          cd ../out && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Build info
+        run: |
+          {
+            echo "### $PKG_NAME"
+            echo "- uname -r: \`$KERNEL_RELEASE\`"
+            echo "- AOSP common: \`$COMMON_COMMIT\` ($COMMON_BRANCH)"
+            echo "- ReSukiSU: \`$RESUKISU_COMMIT\` (version $RESUKISU_VERSION, ref ${{ inputs.resukisu_ref }})"
+            echo "- SUSFS: \`$SUSFS_COMMIT\` (ref ${{ inputs.susfs_ref }})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: out/*
+          compression-level: 0
