@@ -92,9 +92,13 @@ jobs:
             sed -i '/^#include <trace\/hooks\/blk.h>/d' fs/namespace.c
             sed -i 's|^#include <linux/fs_context.h>|#include <trace/hooks/blk.h>\n&|' fs/namespace.c
           fi
+          # The LineageOS tree already contains a stray .rej file; only check new ones.
+          find . -name '*.rej' | sort > /tmp/rej-before
           patch -p1 --forward --fuzz=3 < "$GITHUB_WORKSPACE/susfs/kernel_patches/$SUSFS_PATCH"
-          if find . -name '*.rej' | grep -q .; then
-            echo "::error::SUSFS patch left rejected hunks"; find . -name '*.rej' -exec cat {} +; exit 1
+          find . -name '*.rej' | sort > /tmp/rej-after
+          NEW_REJ=$(comm -13 /tmp/rej-before /tmp/rej-after)
+          if [ -n "$NEW_REJ" ]; then
+            echo "::error::SUSFS patch left rejected hunks"; cat $NEW_REJ; exit 1
           fi
           grep '^#define SUSFS_VERSION' include/linux/susfs.h
 
