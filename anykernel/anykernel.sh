@@ -4,7 +4,7 @@
 ### AnyKernel setup
 # global properties
 properties() { '
-kernel.string=ReSukiSU + SUSFS GKI 5.15.180 for Xiaomi 13 Ultra (ishtar)
+kernel.string=ReSukiSU + SUSFS kernel for Xiaomi 13 Ultra (ishtar)
 do.devicecheck=1
 do.modules=0
 do.systemless=0

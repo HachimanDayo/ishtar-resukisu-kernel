@@ -1,8 +1,12 @@
-name: Build ReSukiSU + SUSFS kernel (AOSP GKI 5.15.180)
+name: Build ReSukiSU + SUSFS kernel (AviumUI / LineageOS 5.15.207)
 
 on:
   workflow_dispatch:
     inputs:
+      kernel_commit:
+        description: "LineageOS/android_kernel_xiaomi_sm8550 commit (the -g<hash> in the ROM's kernel version)"
+        default: "b6fba9b3b25b60776cc435a2d01edd5c3646ce4e"
+        required: true
       resukisu_ref:
         description: "ReSukiSU branch / tag / commit"
         default: "main"
@@ -11,30 +15,32 @@ on:
         description: "susfs4ksu branch / tag / commit"
         default: "gki-android13-5.15"
         required: true
-      version_suffix:
-        description: "uname -r suffix (after 5.15.180)"
-        default: "-android13-8-g39bd6e622fc6"
-        required: true
 
 env:
-  # AOSP android13-5.15-2025-05 release (5.15.180). The branch was renamed to
-  # deprecated/..., so the manifest entry for common/ is pinned to its tip commit.
-  MANIFEST_BRANCH: common-android13-5.15-2025-05
-  COMMON_BRANCH: deprecated/android13-5.15-2025-05
-  COMMON_COMMIT: 39bd6e622fc6c1224c41cf8ae6c1a78340129cb6
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sm8550.git
+  # Same toolchain as the AviumUI build (clang 21, r563880c).
+  CLANG_BRANCH: android16-qpr2-release
+  CLANG_DIR: clang-r563880c
   SUSFS_PATCH: 50_add_susfs_in_gki-android13-5.15.patch
+  # Match the stock AviumUI kernel banner.
+  KBUILD_BUILD_USER: ubuntu
+  KBUILD_BUILD_HOST: ubuntu
+  KBUILD_BUILD_TIMESTAMP: "Fri Aug 7 20:36:15 UTC 2026"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Free disk space
+      - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
                       /usr/local/share/boost /usr/share/swift /usr/local/.ghcup
           sudo docker image prune --all --force || true
-          df -h /
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          df -h / /mnt && free -h
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,30 +49,29 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            git curl zip unzip xz-utils zstd bc bison flex cpio rsync \
-            libssl-dev libelf-dev python3 binutils
-          mkdir -p ~/bin
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
-          chmod +x ~/bin/repo
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+            git curl zip unzip xz-utils zstd bc bison flex cpio rsync kmod \
+            libssl-dev libelf-dev python3 dwarves
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
 
-      - name: Sync kernel source
+      - name: Fetch kernel source
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/kernel" && cd "$GITHUB_WORKSPACE/kernel"
-          repo init --depth=1 --no-use-superproject \
-            -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH"
-          sed -i "s|revision=\"android13-5.15-2025-05\" upstream=\"android13-5.15-2025-05\" dest-branch=\"android13-5.15-2025-05\"|revision=\"$COMMON_COMMIT\" upstream=\"$COMMON_BRANCH\"|" \
-            .repo/manifests/default.xml
-          grep -q "$COMMON_COMMIT" .repo/manifests/default.xml
-          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --fail-fast
-          test "$(git -C common rev-parse HEAD)" = "$COMMON_COMMIT"
-          head -5 common/Makefile
-          df -h /
+          git init -q kernel && cd kernel
+          git fetch --depth=1 "$KERNEL_REPO" "${{ inputs.kernel_commit }}"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %ci %s'
+          head -5 Makefile
+
+      - name: Fetch clang
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse -b "$CLANG_BRANCH" \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang
+          git -C clang sparse-checkout set "$CLANG_DIR"
+          echo "$GITHUB_WORKSPACE/clang/$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "clang/$CLANG_DIR/bin/clang" --version | head -1
 
       - name: Integrate ReSukiSU
-        working-directory: kernel/common
+        working-directory: kernel
         run: |
           curl -LSs https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh \
             | bash -s "${{ inputs.resukisu_ref }}"
@@ -74,13 +79,19 @@ jobs:
           echo "RESUKISU_VERSION=$(( 30000 + $(git -C KernelSU rev-list --count HEAD) + 700 ))" >> "$GITHUB_ENV"
 
       - name: Integrate SUSFS
-        working-directory: kernel/common
+        working-directory: kernel
         run: |
           git clone https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs"
           git -C "$GITHUB_WORKSPACE/susfs" checkout "${{ inputs.susfs_ref }}"
           echo "SUSFS_COMMIT=$(git -C "$GITHUB_WORKSPACE/susfs" rev-parse --short HEAD)" >> "$GITHUB_ENV"
           cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/fs/* fs/
           cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/include/linux/* include/linux/
+          # LineageOS adds <trace/hooks/blk.h> right after "internal.h", which breaks the
+          # first fs/namespace.c hunk's context. Move it above the hunk.
+          if grep -q '^#include <trace/hooks/blk.h>' fs/namespace.c; then
+            sed -i '/^#include <trace\/hooks\/blk.h>/d' fs/namespace.c
+            sed -i 's|^#include <linux/fs_context.h>|#include <trace/hooks/blk.h>\n&|' fs/namespace.c
+          fi
           patch -p1 --forward --fuzz=3 < "$GITHUB_WORKSPACE/susfs/kernel_patches/$SUSFS_PATCH"
           if find . -name '*.rej' | grep -q .; then
             echo "::error::SUSFS patch left rejected hunks"; find . -name '*.rej' -exec cat {} +; exit 1
@@ -88,9 +99,9 @@ jobs:
           grep '^#define SUSFS_VERSION' include/linux/susfs.h
 
       - name: Configure
-        working-directory: kernel/common
+        working-directory: kernel
         run: |
-          cat >> arch/arm64/configs/gki_defconfig <<'EOF'
+          cat > "$GITHUB_WORKSPACE/ksu.config" <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -102,25 +113,32 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_SUS_MAP=y
+          # Thin LTO keeps the final link within the runner's memory.
+          # CONFIG_LTO_CLANG_FULL is not set
+          CONFIG_LTO_CLANG_THIN=y
           EOF
-          # The appended defconfig is no longer in savedefconfig form.
-          sed -i 's/check_defconfig//' build.config.gki
-          # Fixed uname -r suffix; also avoids "-dirty" from the patched tree.
-          echo "${{ inputs.version_suffix }}" > .scmversion
+          # Same kernel version string as the stock build, without "-dirty".
+          echo "-g$(git rev-parse --short=12 HEAD)" > .scmversion
+          MAKE="make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-"
+          $MAKE gki_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config \
+            arch/arm64/configs/vendor/kalama_GKI.config \
+            arch/arm64/configs/vendor/ishtar_GKI.config \
+            "$GITHUB_WORKSPACE/ksu.config"
+          $MAKE olddefconfig
+          for c in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_TARGET_PRODUCT_ISHTAR CONFIG_LTO_CLANG_THIN; do
+            grep -q "^$c=y" out/.config || { echo "::error::$c is not enabled"; exit 1; }
+          done
 
       - name: Build
         working-directory: kernel
         run: |
-          LTO=thin KMI_SYMBOL_LIST_STRICT_MODE=0 \
-            BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
-          DIST=out/android13-5.15/dist
-          ls -la "$DIST"
-          grep -q '^CONFIG_KSU=y' out/android13-5.15/common/.config
-          grep -q '^CONFIG_KSU_SUSFS=y' out/android13-5.15/common/.config
-          BANNER=$(grep -a -o -m1 'Linux version 5\.15[ -~]*' "$DIST/Image")
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc --all)" Image
+          BANNER=$(grep -a -o -m1 'Linux version 5\.15[ -~]*' out/arch/arm64/boot/Image)
           echo "$BANNER"
           echo "KERNEL_RELEASE=$(echo "$BANNER" | awk '{print $3}')" >> "$GITHUB_ENV"
-          cp "$DIST/Image" "$GITHUB_WORKSPACE/Image"
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/Image"
 
       - name: Package
         env:
@@ -135,7 +153,8 @@ jobs:
           {
             echo "### $PKG_NAME"
             echo "- uname -r: \`$KERNEL_RELEASE\`"
-            echo "- AOSP common: \`$COMMON_COMMIT\` ($COMMON_BRANCH)"
+            echo "- Kernel: LineageOS/android_kernel_xiaomi_sm8550 \`${{ inputs.kernel_commit }}\`"
+            echo "- Toolchain: $CLANG_DIR ($CLANG_BRANCH)"
             echo "- ReSukiSU: \`$RESUKISU_COMMIT\` (version $RESUKISU_VERSION, ref ${{ inputs.resukisu_ref }})"
             echo "- SUSFS: \`$SUSFS_COMMIT\` (ref ${{ inputs.susfs_ref }})"
           } >> "$GITHUB_STEP_SUMMARY"
